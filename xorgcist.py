@@ -303,7 +303,7 @@ def parse_xorg_conf(text: str) -> XorgConf:
     sec_re = re.compile(r'^\s*Section\s+"(\w+)"', re.IGNORECASE)
     end_re = re.compile(r'^\s*EndSection', re.IGNORECASE)
     id_re = re.compile(r'^\s*Identifier\s+"(.+?)"', re.IGNORECASE)
-    opt_re = re.compile(r'^\s*Option\s+"(.+?)"\s+"(.+?)"', re.IGNORECASE)
+    opt_re = re.compile(r'^\s*Option\s+"(.+?)"\s+"([^"]*)"', re.IGNORECASE)
     busid_re = re.compile(r'^\s*BusID\s+"(.+?)"', re.IGNORECASE)
     driver_re = re.compile(r'^\s*Driver\s+"(.+?)"', re.IGNORECASE)
     i = 0
@@ -387,14 +387,18 @@ def matrix_multiply(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, 
     )
 
 
-def derive_touchscreen_matrix(state: State, target_name: str) -> tuple[float, ...]:
+def derive_touchscreen_matrix(outputs: list[Output], target_name: str) -> tuple[float, ...]:
     """Compose region (output's rectangle within its X screen's framebuffer)
     × rotation. xinput's `Coordinate Transformation Matrix` expects this
-    9-float row-major form; the matrix is applied per device event."""
-    target = next((o for o in state.outputs if o.name == target_name), None)
+    9-float row-major form; the matrix is applied per device event.
+
+    Takes a list of outputs (not a State) so callers can pass either the raw
+    state.outputs (for UI display) or the vendor-aware-collapsed `eff` copy
+    (for runtime emit on non-NVIDIA, where all outputs share one X screen)."""
+    target = next((o for o in outputs if o.name == target_name), None)
     if target is None:
         return IDENTITY_MATRIX
-    smin_x, smin_y, sw, sh = compute_screen_framebuffer(state.outputs, target.screen_id)
+    smin_x, smin_y, sw, sh = compute_screen_framebuffer(outputs, target.screen_id)
     if sw <= 0 or sh <= 0:
         return rotation_matrix(target.rotation)
     eff_w, eff_h = effective_dimensions(target)
@@ -425,18 +429,24 @@ def snap_output_to_neighbors(outputs: list[Output], dragged: Output,
     if not others:
         return
     dw, dh = effective_dimensions(dragged)
-    xs = [v for o in others for ow, _ in [effective_dimensions(o)] for v in (o.x, o.x + ow)]
-    ys = [v for o in others for _, oh in [effective_dimensions(o)] for v in (o.y, o.y + oh)]
-    for tx in xs:
-        if abs(dragged.x - tx) <= threshold:
-            dragged.x = tx; break
-        if abs((dragged.x + dw) - tx) <= threshold:
-            dragged.x = tx - dw; break
-    for ty in ys:
-        if abs(dragged.y - ty) <= threshold:
-            dragged.y = ty; break
-        if abs((dragged.y + dh) - ty) <= threshold:
-            dragged.y = ty - dh; break
+    xs, ys = [], []
+    for o in others:
+        ow, oh = effective_dimensions(o)
+        xs += [o.x, o.x + ow]
+        ys += [o.y, o.y + oh]
+    # For each axis: collect every (distance, snapped-coord) candidate within
+    # threshold, then pick the closest. Picking "first hit" was order-dependent
+    # and could snap to a farther edge when two neighbors were both in range.
+    cand_x = [(abs(dragged.x - tx), tx) for tx in xs]
+    cand_x += [(abs((dragged.x + dw) - tx), tx - dw) for tx in xs]
+    cand_x = [c for c in cand_x if c[0] <= threshold]
+    if cand_x:
+        dragged.x = min(cand_x)[1]
+    cand_y = [(abs(dragged.y - ty), ty) for ty in ys]
+    cand_y += [(abs((dragged.y + dh) - ty), ty - dh) for ty in ys]
+    cand_y = [c for c in cand_y if c[0] <= threshold]
+    if cand_y:
+        dragged.y = min(cand_y)[1]
 
 
 def normalize_origin(outputs: list[Output]) -> None:
@@ -483,60 +493,86 @@ def enforce_single_primary(outputs: list[Output]) -> None:
 # ============================== EMIT ==============================
 
 def emit_xorg_conf(state: State) -> str:
-    """Emit the full xorg.conf snippet. Resolves mirrors and single-primary
-    on a copy so the user's typed values aren't mutated."""
+    """Emit the full xorg.conf snippet. Vendor-aware:
+
+    * **NVIDIA driver**: emits a Monitor section per X screen, Device sections
+      with the documented `Screen N` directive (only when multi-X-screen,
+      since both Devices share the same BusID), Screen sections with a direct
+      `Monitor "MonitorN"` directive plus the NVIDIA-specific `MetaModes`
+      Option to position multiple physical outputs within each X screen.
+      Verified against NVIDIA's `configmultxscreens.html` for driver versions
+      460 (2021), 470 (2022), and 535 (2024) — syntax stable across them all.
+    * **Other drivers (amdgpu / modesetting / intel / radeon)**: collapses
+      everything to a single minimal Device + Screen section. There is no
+      `Monitor` directive (the driver autodetects via EDID), no MetaModes
+      (NVIDIA-specific; ignored elsewhere), no `Screen N` (NVIDIA-specific
+      multi-X-screen routing). All layout/rotation/positioning happens in
+      the runtime xrandr script — that's how real-world AMD/Intel multi-
+      display setups work, and the Gentoo wiki confirms minimal xorg.conf
+      is the norm for amdgpu.
+
+    Resolves mirrors and single-primary on a copy so the user's typed values
+    aren't mutated."""
     eff = [dataclasses.replace(o, available_modes=list(o.available_modes))
            for o in state.outputs]
     apply_mirroring(eff)
     enforce_single_primary(eff)
 
-    parts = ['# Generated by xorgcist. Review before installing.\n']
+    header = '# Generated by xorgcist. Review before installing.\n'
+    if not any(is_active(o) for o in eff):
+        return header
+
+    gpu = state.gpus[0] if state.gpus else GPU(busid="", vendor="?",
+                                                driver="modesetting", name="?")
+    is_nvidia = gpu.driver == "nvidia"
+
+    if is_nvidia:
+        return _emit_nvidia_conf(eff, gpu, header)
+    return _emit_generic_conf(eff, gpu, header)
+
+
+def _emit_nvidia_conf(eff: list[Output], gpu: GPU, header: str) -> str:
+    """NVIDIA-specific xorg.conf emit. Shape matches NVIDIA's documented
+    multi-X-screen example: per-screen Monitor + Device + Screen sections,
+    Devices share BusID and use the `Screen N` directive, Screens use the
+    `Monitor "MonitorN"` directive plus `Option "MetaModes"` for positioning
+    multiple displays within each X screen."""
     screens: dict[int, list[Output]] = {}
     for o in eff:
         if is_active(o):
             screens.setdefault(o.screen_id, []).append(o)
-    if not screens:
-        return parts[0]
-
-    gpu = state.gpus[0] if state.gpus else GPU(busid="", vendor="?",
-                                                driver="modesetting", name="?")
-
-    # Monitor sections (one per active output; emits Rotate option for non-NVIDIA)
-    for o in eff:
-        if not is_active(o):
-            continue
-        lines = [f'Section "Monitor"', f'    Identifier  "Monitor-{o.name}"']
-        if o.rotation != "normal":
-            lines.append(f'    Option      "Rotate" "{o.rotation}"')
-        lines.append('EndSection\n')
-        parts.append("\n".join(lines))
-
-    # Device + Screen sections (one per X screen)
     sorted_groups = sorted(screens.keys())
+    multi = len(sorted_groups) > 1
+
+    parts = [header]
+    # One Monitor section per X screen, named "MonitorN". NVIDIA's example
+    # uses these as placeholders — driver still autodetects modes via EDID.
+    for runtime_idx, _ in enumerate(sorted_groups):
+        parts.append(
+            f'Section "Monitor"\n'
+            f'    Identifier  "Monitor{runtime_idx}"\n'
+            f'EndSection\n'
+        )
+    # Device + Screen per X screen.
     for runtime_idx, group in enumerate(sorted_groups):
-        # Device
         busid_line = f'    BusID       "{gpu.busid}"\n' if gpu.busid else ""
+        # `Screen N` only when multi-X-screen (without it, two Devices sharing
+        # a BusID would be ambiguous). Single-screen NVIDIA omits it.
+        screen_n_line = f'    Screen      {runtime_idx}\n' if multi else ""
         parts.append(
             f'Section "Device"\n'
             f'    Identifier  "Device{runtime_idx}"\n'
             f'    Driver      "{gpu.driver}"\n'
             f'{busid_line}'
-            f'    Screen      {runtime_idx}\n'
+            f'{screen_n_line}'
             f'EndSection\n'
         )
-        # Screen
         outs_in_screen = screens[group]
         min_x = min(o.x for o in outs_in_screen)
         min_y = min(o.y for o in outs_in_screen)
         depth = max(o.color_depth for o in outs_in_screen)
-        lines = [
-            f'Section "Screen"',
-            f'    Identifier  "Screen{runtime_idx}"',
-            f'    Device      "Device{runtime_idx}"',
-        ]
         metamodes = []
         for o in outs_in_screen:
-            lines.append(f'    Option      "monitor-{o.name}" "Monitor-{o.name}"')
             mode = f"{o.width}x{o.height}"
             if o.refresh_rate > 0:
                 mode += f"_{int(round(o.refresh_rate))}"
@@ -544,25 +580,68 @@ def emit_xorg_conf(state: State) -> str:
             if o.rotation != "normal":
                 entry += f" {{Rotation={o.rotation}}}"
             metamodes.append(entry)
+        screen_lines = [
+            f'Section "Screen"',
+            f'    Identifier  "Screen{runtime_idx}"',
+            f'    Device      "Device{runtime_idx}"',
+            f'    Monitor     "Monitor{runtime_idx}"',
+        ]
         if metamodes:
-            lines.append(f'    Option      "MetaModes" "{", ".join(metamodes)}"')
-        lines += [
+            screen_lines.append(
+                f'    Option      "MetaModes" "{", ".join(metamodes)}"'
+            )
+        screen_lines += [
             '    SubSection  "Display"',
             f'        Depth       {depth}',
             '    EndSubSection',
             'EndSection\n',
         ]
-        parts.append("\n".join(lines))
+        parts.append("\n".join(screen_lines))
 
-    # ServerLayout — uses relative position tokens (Xorg silently zeroes the
-    # absolute-coords form). Each new screen anchors against the closest
-    # already-placed screen.
+    parts.append(_emit_server_layout(eff, sorted_groups))
+    return "\n".join(parts)
+
+
+def _emit_generic_conf(eff: list[Output], gpu: GPU, header: str) -> str:
+    """Minimal xorg.conf for non-NVIDIA drivers (amdgpu/modesetting/intel/...).
+    These drivers don't use MetaModes or NVIDIA's multi-X-screen pattern;
+    the runtime xrandr script handles all layout, positioning, and rotation.
+    User's per-output `screen_id` grouping is ignored here — multi-X-screen
+    is genuinely an NVIDIA-only practical feature."""
+    parts = [header]
+    busid_line = f'    BusID       "{gpu.busid}"\n' if gpu.busid else ""
+    parts.append(
+        f'Section "Device"\n'
+        f'    Identifier  "Device0"\n'
+        f'    Driver      "{gpu.driver}"\n'
+        f'{busid_line}'
+        f'EndSection\n'
+    )
+    parts.append(
+        f'Section "Screen"\n'
+        f'    Identifier  "Screen0"\n'
+        f'    Device      "Device0"\n'
+        f'EndSection\n'
+    )
+    parts.append(
+        f'Section "ServerLayout"\n'
+        f'    Identifier  "Layout0"\n'
+        f'    Screen      0 "Screen0" 0 0\n'
+        f'EndSection\n'
+    )
+    return "\n".join(parts)
+
+
+def _emit_server_layout(eff: list[Output], sorted_groups: list[int]) -> str:
+    """ServerLayout with relative position tokens between Screens. Xorg
+    silently zeroes the absolute-coords form for any but the first Screen,
+    so each subsequent Screen is anchored against the closest already-placed
+    one via RightOf / LeftOf / Above / Below."""
     boxes = [compute_screen_framebuffer(eff, g) for g in sorted_groups]
     layout = ['Section "ServerLayout"', '    Identifier  "Layout0"',
               f'    Screen      0 "Screen0" 0 0']
     placed = [0]
     for i in range(1, len(sorted_groups)):
-        # Pick anchor: closest already-placed screen (squared center distance)
         def dsq(j):
             ax, ay, aw, ah = boxes[j]
             bx, by, bw, bh = boxes[i]
@@ -580,10 +659,8 @@ def emit_xorg_conf(state: State) -> str:
             tok = "Below" if dy >= 0 else "Above"
         layout.append(f'    Screen      {i} "Screen{i}" {tok} "Screen{anchor}"')
         placed.append(i)
-    layout += ['EndSection\n']
-    parts.append("\n".join(layout))
-
-    return "\n".join(parts)
+    layout.append('EndSection\n')
+    return "\n".join(layout)
 
 
 DISPLAY_SETUP_LINE = (
@@ -607,7 +684,25 @@ def emit_runtime_commands(state: State) -> list[str]:
     enforce_single_primary(eff)
     by_name = {o.name: o for o in eff}
 
-    sorted_groups = sorted({o.screen_id for o in eff if is_active(o)})
+    # Multi-X-screen is NVIDIA-only in xorgcist (NVIDIA's `Screen N` + shared
+    # BusID + MetaModes pattern). For other drivers (amdgpu/modesetting/intel/
+    # radeon) the xorg.conf is collapsed to a single Screen and xrandr does
+    # all positioning at runtime — the script must match. Real multi-X-screen
+    # on those drivers uses `Option "ZaphodHeads"` which is a different
+    # mechanism, out of scope here.
+    gpu = state.gpus[0] if state.gpus else GPU(busid="", vendor="?",
+                                                driver="modesetting", name="?")
+    is_nvidia = gpu.driver == "nvidia"
+    if is_nvidia:
+        sorted_groups = sorted({o.screen_id for o in eff if is_active(o)})
+    else:
+        # Treat every active output as if it were on a single X screen.
+        # We use the *minimum* user-set screen_id as the canonical one so
+        # `compute_screen_framebuffer` is called with a key that exists in eff.
+        active_ids = {o.screen_id for o in eff if is_active(o)}
+        sorted_groups = [min(active_ids)] if active_ids else []
+        for o in eff:
+            o.screen_id = sorted_groups[0] if sorted_groups else 0
     multi = len(sorted_groups) > 1
     cmds: list[str] = []
     if multi:
@@ -628,7 +723,12 @@ def emit_runtime_commands(state: State) -> list[str]:
             if any((mw, mh) == target and abs(mr - o.refresh_rate) < REFRESH_TOLERANCE_HZ
                    for mw, mh, mr in o.available_modes):
                 parts.append(f'--rate {o.refresh_rate:.2f}')
-            if o.mirror_of and o.mirror_of != o.name:
+            # Mirror only if the target is a real, active output; otherwise
+            # `xrandr --same-as <missing>` errors and breaks the rest of the
+            # script under `set -e`. Fall through to absolute --pos.
+            mirror_target = (by_name.get(o.mirror_of)
+                             if o.mirror_of and o.mirror_of != o.name else None)
+            if mirror_target is not None and is_active(mirror_target):
                 parts.append(f'--same-as {o.mirror_of}')
             else:
                 parts.append(f'--pos {o.x - smin_x}x{o.y - smin_y}')
@@ -653,12 +753,13 @@ def emit_runtime_commands(state: State) -> list[str]:
         prefix = f'DISPLAY="$_X.{rt_idx}" ' if multi and rt_idx >= 0 else ''
         cmds.append(f'{prefix}xrandr --output {o.name} --off')
 
-    # Touchscreens. xinput operates server-wide; commands inherit $DISPLAY
-    # from the user's session. For a touch on a non-default X screen we
-    # create a dedicated master pointer pair (one per target screen, deduped)
-    # and reattach the touchscreen to its pointer half so events route there.
-    default_group = sorted_groups[0] if sorted_groups else None
-    masters_emitted: set[int] = set()
+    # Touchscreens. xinput operates server-wide and inherits $DISPLAY from
+    # the user's session. Calibration is just enable + set the Coordinate
+    # Transformation Matrix — the matrix is screen-relative to the device's
+    # current master pointer, which on real-world setups lives where the
+    # physical touch panel is. (Multi-pointer X via `xinput create-master /
+    # reattach` is a separate feature for multi-user touch tables; not what
+    # touchscreen calibration needs.)
     for ts in state.touchscreens:
         if not ts.enabled:
             cmds.append(f'xinput disable {ts.device_id}')
@@ -668,15 +769,11 @@ def emit_runtime_commands(state: State) -> list[str]:
         target = by_name.get(ts.target_output)
         if target is None or not is_active(target):
             continue
-        if multi and target.screen_id != default_group:
-            target_rt_idx = sorted_groups.index(target.screen_id)
-            master = f"xorgcist-screen{target_rt_idx}"
-            if target_rt_idx not in masters_emitted:
-                cmds.append(f'xinput create-master "{master}"')
-                masters_emitted.add(target_rt_idx)
-            cmds.append(f'xinput reattach {ts.device_id} "{master} pointer"')
         cmds.append(f'xinput enable {ts.device_id}')
-        m = derive_touchscreen_matrix(state, ts.target_output)
+        # Pass `eff` (which has been collapsed for non-NVIDIA) so the matrix
+        # is computed against the same screen layout the runtime script will
+        # actually be applied against.
+        m = derive_touchscreen_matrix(eff, ts.target_output)
         cmds.append(
             f'xinput set-prop {ts.device_id} "Coordinate Transformation Matrix" '
             + " ".join(f"{v:.6f}" for v in m)
@@ -911,10 +1008,11 @@ def redraw_form(s: State) -> None:
     dpg.delete_item(T_FORM, children_only=True)
     # Per-output item-handler registries from the previous redraw — they live
     # globally (not under T_FORM) so children_only=True doesn't drop them.
-    for o in s.outputs:
-        h_tag = f"form_handler_{o.name}"
-        if dpg.does_item_exist(h_tag):
-            dpg.delete_item(h_tag)
+    # Iterate by alias prefix rather than by current outputs so handlers for
+    # outputs removed since the last redraw (e.g., after Reload) get cleaned up.
+    for tag in list(dpg.get_aliases()):
+        if tag.startswith("form_handler_"):
+            dpg.delete_item(tag)
     for o in s.outputs:
         if not o.connected:
             continue
@@ -1008,7 +1106,9 @@ def redraw_touch(s: State) -> None:
                               width=W_DROP_WIDE, callback=cb_touch_target,
                               user_data=(s, ts.device_id))
             if ts.target_output and ts.enabled:
-                m = derive_touchscreen_matrix(s, ts.target_output)
+                # UI display: use raw outputs (matches what the user sees in
+                # the layout canvas, not the collapsed-for-runtime view).
+                m = derive_touchscreen_matrix(s.outputs, ts.target_output)
                 dpg.add_text(
                     f"    [{m[0]:.4f} {m[1]:.4f} {m[2]:.4f}]\n"
                     f"    [{m[3]:.4f} {m[4]:.4f} {m[5]:.4f}]\n"
@@ -1272,9 +1372,9 @@ def build_ui(s: State) -> None:
                     pass
             with dpg.tab(label="Touchscreen Mapping"):
                 dpg.add_text(
-                    "Map each touchscreen to its physical output. Matrix is derived from layout "
-                    "+ rotation. Multi-X-screen targeting requires manual `xinput reattach` to a "
-                    "master pointer on the target screen.",
+                    "Map each touchscreen to its physical output. The Coordinate "
+                    "Transformation Matrix is derived from your layout + rotation; "
+                    "applied via `xinput set-prop`.",
                     color=COLOR_DIM, wrap=900,
                 )
                 dpg.add_separator()

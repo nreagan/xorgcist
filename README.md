@@ -1,6 +1,6 @@
 # xorgcist
 
-[![tests](https://github.com/<your-fork>/xorgcist/actions/workflows/test.yml/badge.svg)](https://github.com/<your-fork>/xorgcist/actions/workflows/test.yml)
+[![tests](https://github.com/nreagan/xorgcist/actions/workflows/test.yml/badge.svg)](https://github.com/nreagan/xorgcist/actions/workflows/test.yml)
 
 A Linux GUI for X11 multi-display and input configuration — the things nvidia-settings stopped doing well.
 
@@ -21,7 +21,7 @@ It reads your current setup, lets you visually edit display layout, input routin
 **Install**
 
 ```sh
-git clone https://github.com/<your-fork>/xorgcist.git
+git clone https://github.com/nreagan/xorgcist.git
 cd xorgcist
 pip install -r requirements.txt
 ```
