@@ -1,7 +1,7 @@
 """xorgcist — Linux GUI for X11 multi-display and input configuration.
 
 Single file. Layout: imports → constants → dataclasses → parse → compute →
-emit → validate → dryrun → state regen → UI callbacks → UI render → UI build → main.
+emit → validate → state regen → UI callbacks → UI render → UI build → main.
 
 Design: one `State` dataclass holds everything (semantic + render-transient
 + derived). Pure functions transform state into text. Callbacks mutate state
@@ -15,13 +15,22 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
-import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import dearpygui.dearpygui as dpg
+try:
+    import dearpygui.dearpygui as dpg
+except OSError as _e:
+    if "GLIBC" in str(_e):
+        sys.stderr.write(
+            "xorgcist: installed dearpygui needs a newer glibc than this system has.\n"
+            f"  detail: {_e}\n"
+            "  fix:    pip install --force-reinstall 'dearpygui<=1.9.0'\n"
+            "          (RHEL8 ships glibc 2.28; dearpygui 1.9.1+ requires 2.29+)\n"
+        )
+        sys.exit(1)
+    raise
 
 
 # ============================== CONSTANTS ==============================
@@ -37,9 +46,6 @@ REFRESH_TOLERANCE_HZ = 0.01
 SNAP_THRESHOLD_FB = 20
 SCREEN_GROUP_MAX = 15
 
-DRYRUN_DISPLAY = 3
-DRYRUN_TIMEOUT_S = 8.0
-
 ROTATIONS = ("normal", "left", "right", "inverted")
 COLOR_DEPTHS = (16, 24, 30)
 
@@ -54,7 +60,6 @@ T_TOUCH_LIST = "touch_list"
 T_CONFIG = "config_preview"
 T_RUNTIME = "runtime_preview"
 T_VALIDATION = "validation_log"
-T_DRYRUN = "dryrun_log"
 T_STATUS = "status_bar"
 T_HEADER = "header_counts"
 T_CANVAS_HANDLERS = "canvas_handlers"
@@ -154,10 +159,6 @@ class State:
     canvas_off_y: float = 0.0
     ui_scale: float = 1.0
     status_message: str = "Ready."
-    dryrun_message: str = ""
-    dryrun_running: bool = False
-    pending_dryrun: Optional[tuple[bool, str]] = None
-    pending_lock: threading.Lock = field(default_factory=threading.Lock)
     env_session: str = "?"
     env_wayland: bool = False
     env_display: str = "?"
@@ -535,7 +536,7 @@ def emit_xorg_conf(state: State) -> str:
         ]
         metamodes = []
         for o in outs_in_screen:
-            lines.append(f'    Option      "Monitor-{o.name}" "Monitor-{o.name}"')
+            lines.append(f'    Option      "monitor-{o.name}" "Monitor-{o.name}"')
             mode = f"{o.width}x{o.height}"
             if o.refresh_rate > 0:
                 mode += f"_{int(round(o.refresh_rate))}"
@@ -585,9 +586,21 @@ def emit_xorg_conf(state: State) -> str:
     return "\n".join(parts)
 
 
+DISPLAY_SETUP_LINE = (
+    '_X="${DISPLAY:-:0}"; _X="${_X%.*}"   '
+    '# X server from $DISPLAY (handles :N, :N.M, host:N.M, unset)'
+)
+
+
 def emit_runtime_commands(state: State) -> list[str]:
     """xrandr layout commands + xinput touchscreen calibration. Use this
-    script in autostart / .xinitrc / a systemd user unit."""
+    script in autostart / .xinitrc / a systemd user unit.
+
+    Multi-X-screen scripts derive the X server number from $DISPLAY at
+    runtime (not at emit time) so the same script works regardless of login
+    order — second-user sessions get :1, third get :2, etc., and the script
+    follows. xinput commands are server-wide and use whatever $DISPLAY is set
+    to, no prefix needed."""
     eff = [dataclasses.replace(o, available_modes=list(o.available_modes))
            for o in state.outputs]
     apply_mirroring(eff)
@@ -597,11 +610,13 @@ def emit_runtime_commands(state: State) -> list[str]:
     sorted_groups = sorted({o.screen_id for o in eff if is_active(o)})
     multi = len(sorted_groups) > 1
     cmds: list[str] = []
+    if multi:
+        cmds.append(DISPLAY_SETUP_LINE)
 
     # Active outputs per screen, mirrors after non-mirrors so --same-as targets
     # are configured first.
     for rt_idx, group in enumerate(sorted_groups):
-        prefix = f'DISPLAY=:0.{rt_idx} ' if multi else ''
+        prefix = f'DISPLAY="$_X.{rt_idx}" ' if multi else ''
         smin_x, smin_y, _, _ = compute_screen_framebuffer(eff, group)
         in_screen = [o for o in eff if is_active(o) and o.screen_id == group]
         in_screen.sort(key=lambda o: 1 if o.mirror_of and o.mirror_of != o.name else 0)
@@ -635,13 +650,15 @@ def emit_runtime_commands(state: State) -> list[str]:
             rt_idx = 0
         else:
             rt_idx = -1
-        prefix = f'DISPLAY=:0.{rt_idx} ' if multi and rt_idx >= 0 else ''
+        prefix = f'DISPLAY="$_X.{rt_idx}" ' if multi and rt_idx >= 0 else ''
         cmds.append(f'{prefix}xrandr --output {o.name} --off')
 
-    # Touchscreens — server-global xinput, no DISPLAY prefix. Calibrated for
-    # the target's screen geometry, but actually routes to that screen only
-    # if the user manually attaches the device to a master pointer there.
+    # Touchscreens. xinput operates server-wide; commands inherit $DISPLAY
+    # from the user's session. For a touch on a non-default X screen we
+    # create a dedicated master pointer pair (one per target screen, deduped)
+    # and reattach the touchscreen to its pointer half so events route there.
     default_group = sorted_groups[0] if sorted_groups else None
+    masters_emitted: set[int] = set()
     for ts in state.touchscreens:
         if not ts.enabled:
             cmds.append(f'xinput disable {ts.device_id}')
@@ -651,22 +668,23 @@ def emit_runtime_commands(state: State) -> list[str]:
         target = by_name.get(ts.target_output)
         if target is None or not is_active(target):
             continue
+        if multi and target.screen_id != default_group:
+            target_rt_idx = sorted_groups.index(target.screen_id)
+            master = f"xorgcist-screen{target_rt_idx}"
+            if target_rt_idx not in masters_emitted:
+                cmds.append(f'xinput create-master "{master}"')
+                masters_emitted.add(target_rt_idx)
+            cmds.append(f'xinput reattach {ts.device_id} "{master} pointer"')
         cmds.append(f'xinput enable {ts.device_id}')
         m = derive_touchscreen_matrix(state, ts.target_output)
         cmds.append(
             f'xinput set-prop {ts.device_id} "Coordinate Transformation Matrix" '
             + " ".join(f"{v:.6f}" for v in m)
         )
-        if multi and target.screen_id != default_group:
-            cmds.append(
-                f'# NOTE device {ts.device_id} targets a non-default X screen — '
-                f'attach it to a master pointer there first '
-                f'(see xinput create-master / reattach).'
-            )
     return cmds
 
 
-# ============================== VALIDATE + DRYRUN ==============================
+# ============================== VALIDATE ==============================
 
 def validate_xorg_conf(text: str) -> list[ValidationError]:
     errors: list[ValidationError] = []
@@ -700,37 +718,6 @@ def validate_xorg_conf(text: str) -> list[ValidationError]:
                 errors.append(ValidationError(
                     "warning", f'Device "{s.identifier}" has unusual BusID "{busid}"'))
     return errors
-
-
-def dryrun_xorg_config(conf_text: str, display_num: int = DRYRUN_DISPLAY,
-                       timeout: float = DRYRUN_TIMEOUT_S) -> tuple[bool, str]:
-    """Boot a sandboxed Xorg using the generated config without disturbing
-    the user's session. -sharevts -novtswitch -keeptty avoid VT contention;
-    Xorg.wrap on Fedora/Debian may still reject non-root invocations."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
-        f.write(conf_text)
-        conf_path = f.name
-    try:
-        proc = subprocess.Popen(
-            ["Xorg", f":{display_num}", "-config", conf_path,
-             "-noreset", "-sharevts", "-novtswitch", "-keeptty"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        try:
-            out, _ = proc.communicate(timeout=timeout)
-            return (proc.returncode == 0, (out or "").strip())
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            try:
-                out, _ = proc.communicate(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                out = ""
-            return (True, f"Xorg ran for {timeout}s without exiting — likely OK.\n\n{(out or '').strip()}")
-    except FileNotFoundError:
-        return (False, "Xorg binary not found in PATH.")
-    finally:
-        Path(conf_path).unlink(missing_ok=True)
 
 
 # ============================== STATE INIT + REGEN ==============================
@@ -802,7 +789,6 @@ def redraw_full(s: State) -> None:
     redraw_preview(s)
     redraw_header(s)
     redraw_status(s)
-    redraw_dryrun_msg(s)
 
 
 def redraw_canvas_only(s: State) -> None:
@@ -817,11 +803,6 @@ def redraw_canvas_only(s: State) -> None:
 def redraw_status(s: State) -> None:
     if dpg.does_item_exist(T_STATUS):
         dpg.set_value(T_STATUS, s.status_message)
-
-
-def redraw_dryrun_msg(s: State) -> None:
-    if dpg.does_item_exist(T_DRYRUN):
-        dpg.set_value(T_DRYRUN, s.dryrun_message)
 
 
 def redraw_header(s: State) -> None:
@@ -1246,28 +1227,8 @@ def build_ui(s: State) -> None:
         s.selected_output = None
         s.dragging_output = None
         s.drag_anchor_fb = (0, 0)
-        with s.pending_lock:
-            s.pending_dryrun = None
-        s.dryrun_running = False
-        s.dryrun_message = ""
         s.status_message = "Reloaded state from system"
         redraw_full(s)
-
-    def dryrun_cb():
-        if s.dryrun_running:
-            return
-        s.dryrun_running = True
-        s.dryrun_message = "Running Xorg test on :3 (up to 8s)..."
-        redraw_dryrun_msg(s)
-        snapshot = s.generated_config
-        def worker():
-            try:
-                ok, log = dryrun_xorg_config(snapshot)
-            except Exception as e:
-                ok, log = False, f"dryrun crashed: {e}"
-            with s.pending_lock:
-                s.pending_dryrun = (ok, log)
-        threading.Thread(target=worker, daemon=True).start()
 
     def copy_config():
         try:
@@ -1326,16 +1287,11 @@ def build_ui(s: State) -> None:
                             dpg.add_button(label="Save...",
                                            callback=lambda: dpg.show_item("save_config_dialog"))
                             dpg.add_button(label="Copy", callback=copy_config)
-                            dpg.add_button(label="Test in nested server (:3)",
-                                           callback=dryrun_cb)
                         dpg.add_input_text(tag=T_CONFIG, multiline=True, readonly=True,
                                            width=-1, height=-PREVIEW_BOTTOM_RESERVE)
                         dpg.add_text("Validation:")
                         dpg.add_input_text(tag=T_VALIDATION, multiline=True, readonly=True,
-                                           width=-1, height=70)
-                        dpg.add_text("Dry-run output:")
-                        dpg.add_input_text(tag=T_DRYRUN, multiline=True, readonly=True,
-                                           width=-1, height=70)
+                                           width=-1, height=-1)
                     with dpg.tab(label="Runtime commands (xrandr + xinput)"):
                         dpg.add_text(
                             "Apply at session start (autostart, .xinitrc, systemd user unit).",
@@ -1358,29 +1314,7 @@ def build_ui(s: State) -> None:
     dpg.show_viewport()
     cb_viewport_resize(s)
     redraw_full(s)
-
-    # Manual frame loop so we can pump the dryrun thread's pending result
-    # back onto the main thread without crashing Dear PyGui.
-    while dpg.is_dearpygui_running():
-        with s.pending_lock:
-            result = s.pending_dryrun
-            if result is not None:
-                s.pending_dryrun = None
-                s.dryrun_running = False
-        if result is not None:
-            ok, log = result
-            s.dryrun_message = ("[OK] " if ok else "[FAIL] ") + log
-            s.status_message = "Dry-run completed" if ok else "Dry-run reported errors"
-            try:
-                redraw_dryrun_msg(s)
-                redraw_status(s)
-            except Exception as e:
-                print(f"xorgcist: redraw after dryrun: {e}", file=sys.stderr)
-        try:
-            dpg.render_dearpygui_frame()
-        except Exception as e:
-            print(f"xorgcist: render_dearpygui_frame: {e}", file=sys.stderr)
-
+    dpg.start_dearpygui()
     dpg.destroy_context()
 
 

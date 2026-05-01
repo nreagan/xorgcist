@@ -619,6 +619,18 @@ class TestEmitXorgConf(unittest.TestCase):
         text = emit_xorg_conf(s)
         self.assertNotIn("DP-2:", text)
 
+    def test_monitor_option_uses_lowercase_prefix_per_nvidia_docs(self):
+        # NVIDIA documents the binding as: Option "monitor-<port>" "<MonitorIdent>"
+        # Earlier emitter had a copy-paste typo that put 'Monitor-' on both sides
+        # ('Option "Monitor-DP-1" "Monitor-DP-1"'), which the driver silently
+        # ignored — the option key needs to be lowercase 'monitor-' so the
+        # driver actually wires the Monitor section to the output.
+        s = State()
+        s.outputs = [Output("DP-0.8", connected=True, width=1920, height=1080)]
+        text = emit_xorg_conf(s)
+        self.assertIn('Option      "monitor-DP-0.8" "Monitor-DP-0.8"', text)
+        self.assertNotIn('Option      "Monitor-DP-0.8" "Monitor-DP-0.8"', text)
+
 
 class TestEmitRuntimeCommands(unittest.TestCase):
     def test_basic_xrandr(self):
@@ -647,17 +659,34 @@ class TestEmitRuntimeCommands(unittest.TestCase):
         cmds = emit_runtime_commands(s)
         self.assertNotIn("--rate", cmds[0])
 
-    def test_multi_screen_uses_display_prefix(self):
+    def test_multi_screen_uses_display_prefix_with_runtime_derivation(self):
+        # Multi-X-screen scripts derive the X server number from $DISPLAY at
+        # script-runtime via shell parameter expansion (handles RHEL8 :1,
+        # second-user logins :2, multi-seat, etc.) so the same script works
+        # regardless of login order. The setup line is the first command.
         s = State()
         s.outputs = [
             Output("DP-1", connected=True, width=2560, height=1440, x=0, y=0, screen_id=0),
             Output("HDMI-1", connected=True, width=1920, height=1080, x=4480, screen_id=1),
         ]
         cmds = emit_runtime_commands(s)
+        self.assertTrue(cmds[0].startswith('_X='))
+        self.assertIn('${DISPLAY:-:0}', cmds[0])
+        self.assertIn('${_X%.*}', cmds[0])
         dp1 = next(c for c in cmds if "--output DP-1" in c)
         hdmi = next(c for c in cmds if "--output HDMI-1" in c)
-        self.assertTrue(dp1.startswith("DISPLAY=:0.0 "))
-        self.assertTrue(hdmi.startswith("DISPLAY=:0.1 "))
+        self.assertTrue(dp1.startswith('DISPLAY="$_X.0" '))
+        self.assertTrue(hdmi.startswith('DISPLAY="$_X.1" '))
+
+    def test_single_screen_omits_setup_line_and_display_prefix(self):
+        # Single-screen scripts have no DISPLAY indirection — the user's
+        # session $DISPLAY already points to the right place.
+        s = State()
+        s.outputs = [Output("DP-1", connected=True, width=1920, height=1080, screen_id=0)]
+        cmds = emit_runtime_commands(s)
+        self.assertFalse(any(c.startswith('_X=') for c in cmds))
+        for c in cmds:
+            self.assertFalse(c.startswith("DISPLAY="))
 
     def test_disabled_emits_off(self):
         s = State()
@@ -676,7 +705,7 @@ class TestEmitRuntimeCommands(unittest.TestCase):
         ]
         cmds = emit_runtime_commands(s)
         for c in cmds:
-            self.assertNotIn("DISPLAY=:0.1 ", c)
+            self.assertNotIn('DISPLAY="$_X.1"', c)
         self.assertTrue(any("--output DP-2 --off" in c for c in cmds))
 
     def test_rotation_in_xrandr(self):
@@ -740,8 +769,11 @@ class TestEmitRuntimeCommands(unittest.TestCase):
         self.assertEqual(xinput[0], "xinput enable 15")
         self.assertTrue(xinput[1].startswith("xinput set-prop 15"))
 
-    def test_xinput_no_display_prefix(self):
-        # xinput devices are server-global; DISPLAY prefix would be cosmetic.
+    def test_xinput_lines_have_no_display_prefix(self):
+        # All xinput operations (create-master, reattach, enable, set-prop,
+        # disable) are server-wide and inherit $DISPLAY from the user's
+        # session. Adding a DISPLAY prefix would be redundant and would only
+        # add a second source of truth for which X server to talk to.
         s = State()
         s.outputs = [
             Output("DP-1", connected=True, width=1920, height=1080, screen_id=0),
@@ -751,10 +783,13 @@ class TestEmitRuntimeCommands(unittest.TestCase):
                                              target_output="HDMI-1")]
         cmds = emit_runtime_commands(s)
         for c in cmds:
-            if c.startswith("xinput"):
+            if "xinput" in c:
                 self.assertFalse(c.startswith("DISPLAY="))
 
-    def test_multi_screen_emits_master_pointer_note(self):
+    def test_multi_screen_emits_create_master_and_reattach(self):
+        # For touch on a non-default X screen, the script must create a
+        # dedicated master pointer pair and reattach the touchscreen to it.
+        # The earlier emitter only printed a hint comment.
         s = State()
         s.outputs = [
             Output("DP-1", connected=True, width=1920, height=1080, screen_id=0),
@@ -763,7 +798,57 @@ class TestEmitRuntimeCommands(unittest.TestCase):
         s.touchscreens = [TouchscreenMapping(device_id=15, device_name="ELO",
                                              target_output="HDMI-1")]
         cmds = emit_runtime_commands(s)
-        self.assertTrue(any("master pointer" in c.lower() for c in cmds))
+        self.assertIn('xinput create-master "xorgcist-screen1"', cmds)
+        self.assertIn('xinput reattach 15 "xorgcist-screen1 pointer"', cmds)
+        # Order: create-master before reattach before enable/set-prop
+        create_idx = next(i for i, c in enumerate(cmds) if "create-master" in c)
+        reattach_idx = next(i for i, c in enumerate(cmds) if "reattach" in c)
+        setprop_idx = next(i for i, c in enumerate(cmds) if "set-prop" in c)
+        self.assertLess(create_idx, reattach_idx)
+        self.assertLess(reattach_idx, setprop_idx)
+
+    def test_no_create_master_for_default_screen(self):
+        s = State()
+        s.outputs = [Output("DP-1", connected=True, width=1920, height=1080, screen_id=0)]
+        s.touchscreens = [TouchscreenMapping(device_id=15, device_name="ELO",
+                                             target_output="DP-1")]
+        cmds = emit_runtime_commands(s)
+        self.assertFalse(any("create-master" in c for c in cmds))
+        self.assertFalse(any("reattach" in c for c in cmds))
+
+    def test_create_master_deduped_for_same_target_screen(self):
+        s = State()
+        s.outputs = [
+            Output("DP-1", connected=True, width=1920, height=1080, screen_id=0),
+            Output("HDMI-1", connected=True, width=1920, height=1080, x=1920, screen_id=1),
+        ]
+        s.touchscreens = [
+            TouchscreenMapping(device_id=15, device_name="ELO-A", target_output="HDMI-1"),
+            TouchscreenMapping(device_id=16, device_name="ELO-B", target_output="HDMI-1"),
+        ]
+        cmds = emit_runtime_commands(s)
+        creates = [c for c in cmds if "create-master" in c]
+        reattaches = [c for c in cmds if "reattach" in c]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(reattaches), 2)
+
+    def test_runtime_script_independent_of_state_env_display(self):
+        # state.env_display is captured for diagnostic display in the UI but
+        # MUST NOT be baked into the emitted script — login order varies, and
+        # the script needs to work whether the user is :0, :1, or :47 today.
+        s_zero = State(); s_zero.env_display = ":0"
+        s_one = State();  s_one.env_display = ":1"
+        s_arb = State();  s_arb.env_display = ":47.2"
+        for s in (s_zero, s_one, s_arb):
+            s.outputs = [
+                Output("DP-1", connected=True, width=1920, height=1080, screen_id=0),
+                Output("HDMI-1", connected=True, width=1920, height=1080, x=1920, screen_id=1),
+            ]
+        cmds_zero = emit_runtime_commands(s_zero)
+        cmds_one = emit_runtime_commands(s_one)
+        cmds_arb = emit_runtime_commands(s_arb)
+        self.assertEqual(cmds_zero, cmds_one)
+        self.assertEqual(cmds_one, cmds_arb)
 
     def test_stale_touchscreen_target_skipped(self):
         s = State()
@@ -821,6 +906,117 @@ class TestValidate(unittest.TestCase):
         )
         errors = validate_xorg_conf(text)
         self.assertFalse(any("BusID" in e.message for e in errors))
+
+
+# ============================== GOLDEN FIXTURES ==============================
+# These pin the exact text emitted for a comprehensive synthetic state. They
+# catch unintended changes to formatting / ordering / whitespace that
+# per-feature assertions would miss. They are NOT proof of correctness — only
+# regression markers. If you intentionally change emitter output, regenerate
+# the strings below by running this state through `regenerate()` and verify
+# the result loads in real Xorg before committing.
+
+GOLDEN_XORG_CONF = """\
+# Generated by xorgcist. Review before installing.
+
+Section "Monitor"
+    Identifier  "Monitor-DP-1"
+EndSection
+
+Section "Monitor"
+    Identifier  "Monitor-DP-2"
+EndSection
+
+Section "Monitor"
+    Identifier  "Monitor-HDMI-1"
+    Option      "Rotate" "left"
+EndSection
+
+Section "Device"
+    Identifier  "Device0"
+    Driver      "nvidia"
+    BusID       "PCI:1:0:0"
+    Screen      0
+EndSection
+
+Section "Screen"
+    Identifier  "Screen0"
+    Device      "Device0"
+    Option      "monitor-DP-1" "Monitor-DP-1"
+    Option      "monitor-DP-2" "Monitor-DP-2"
+    Option      "MetaModes" "DP-1: 2560x1440_144+0+0, DP-2: 1920x1080_60+2560+360"
+    SubSection  "Display"
+        Depth       24
+    EndSubSection
+EndSection
+
+Section "Device"
+    Identifier  "Device1"
+    Driver      "nvidia"
+    BusID       "PCI:1:0:0"
+    Screen      1
+EndSection
+
+Section "Screen"
+    Identifier  "Screen1"
+    Device      "Device1"
+    Option      "monitor-HDMI-1" "Monitor-HDMI-1"
+    Option      "MetaModes" "HDMI-1: 1920x1080_60+0+0 {Rotation=left}"
+    SubSection  "Display"
+        Depth       24
+    EndSubSection
+EndSection
+
+Section "ServerLayout"
+    Identifier  "Layout0"
+    Screen      0 "Screen0" 0 0
+    Screen      1 "Screen1" RightOf "Screen0"
+EndSection
+"""
+
+GOLDEN_RUNTIME = [
+    '_X="${DISPLAY:-:0}"; _X="${_X%.*}"   # X server from $DISPLAY (handles :N, :N.M, host:N.M, unset)',
+    'DISPLAY="$_X.0" xrandr --output DP-1 --mode 2560x1440 --rate 144.00 --pos 0x0 --primary',
+    'DISPLAY="$_X.0" xrandr --output DP-2 --mode 1920x1080 --rate 60.00 --pos 2560x360',
+    'DISPLAY="$_X.1" xrandr --output HDMI-1 --mode 1920x1080 --rate 60.00 --pos 0x0 --rotate left',
+    'xinput create-master "xorgcist-screen1"',
+    'xinput reattach 15 "xorgcist-screen1 pointer"',
+    'xinput enable 15',
+    'xinput set-prop 15 "Coordinate Transformation Matrix" '
+    '0.000000 -1.000000 1.000000 1.000000 0.000000 0.000000 0.000000 0.000000 1.000000',
+]
+
+
+def _golden_state():
+    """Synthetic state exercising: multi-X-screen, NVIDIA driver, primary,
+    rotation, RHEL8-style env_display=':1', touchscreen on non-default screen."""
+    s = State()
+    s.env_display = ":1"
+    s.gpus = [GPU(busid="PCI:1:0:0", vendor="NVIDIA", driver="nvidia", name="RTX 4090")]
+    s.outputs = [
+        Output("DP-1", connected=True, width=2560, height=1440, x=0, y=0,
+               primary=True, screen_id=0, refresh_rate=144.0,
+               available_modes=[(2560, 1440, 144.0)]),
+        Output("DP-2", connected=True, width=1920, height=1080, x=2560, y=360,
+               screen_id=0, refresh_rate=60.0,
+               available_modes=[(1920, 1080, 60.0)]),
+        Output("HDMI-1", connected=True, width=1920, height=1080, x=4480, y=0,
+               screen_id=1, rotation="left", refresh_rate=60.0,
+               available_modes=[(1920, 1080, 60.0)]),
+    ]
+    s.touchscreens = [TouchscreenMapping(device_id=15, device_name="ELO",
+                                         target_output="HDMI-1")]
+    return s
+
+
+class TestGoldenFixtures(unittest.TestCase):
+    def test_golden_xorg_conf_byte_equal(self):
+        # If this fails after an intentional emitter change: regenerate
+        # GOLDEN_XORG_CONF, validate the new output in real Xorg, and update.
+        self.assertEqual(emit_xorg_conf(_golden_state()), GOLDEN_XORG_CONF)
+
+    def test_golden_runtime_byte_equal(self):
+        self.assertEqual(emit_runtime_commands(_golden_state()), GOLDEN_RUNTIME)
 
 
 # ============================== INTEGRATION ==============================

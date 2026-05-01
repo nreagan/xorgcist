@@ -13,9 +13,10 @@ It reads your current setup, lets you visually edit display layout, input routin
 **Requirements**
 
 - Linux running an X11 session (not Wayland)
-- Python 3.10 or newer
+- Python 3.10 or 3.11 (dearpygui 1.9.0 has no wheels for 3.12+)
 - `xrandr`, `xinput`, and `lspci` on `PATH` (standard on any X11 desktop)
-- Optional: `Xorg` binary, used by the **Test in nested server** button to boot a sandboxed X server on `:3` for dry-run verification
+
+> **glibc note**: `requirements.txt` pins `dearpygui<=1.9.0` because 1.9.1+ require glibc 2.29+. RHEL8 ships glibc 2.28, so newer wheels install but fail at import. If you're on a newer distro you can lift the cap, but the pinned version works everywhere.
 
 **Install**
 
@@ -49,8 +50,9 @@ python3 xorgcist.py --demo
 1. xorgcist opens populated with your current displays, input devices, and touchscreens — pulled from `xrandr`, `xinput`, and your existing `xorg.conf`.
 2. Edit any of the three independent sections (display layout, input routing, touchscreen mapping). Skip the ones you don't need.
 3. Review the generated `xorg.conf` snippet and runtime `xrandr` script in the preview panes. The built-in validator lints them on every change.
-4. Optionally click **Test in nested server** to boot a sandboxed `Xorg -config` on `:3` and verify the config without touching your running session.
-5. Save via the standard file dialog or copy to clipboard. xorgcist does not pick paths or install anything for you — drop the snippet into `/etc/X11/xorg.conf.d/`, an autostart script, version control, or wherever fits your setup.
+4. Save via the standard file dialog or copy to clipboard. xorgcist does not pick paths or install anything for you — drop the snippet into `/etc/X11/xorg.conf.d/`, an autostart script, version control, or wherever fits your setup. The real test is loading it in your actual X session.
+
+> **Shell note:** the generated runtime script is POSIX sh. It works as-is in `.xinitrc`, autostart `Exec=`, systemd user units, or anywhere `/bin/sh` runs it (every Linux distro). Multi-X-screen scripts derive the X server number from `$DISPLAY` at runtime, so the same script works whether you log in first (`:0`), second (`:1`), or under multi-seat. csh users running it as a file are fine; csh users sourcing it interactively will need to wrap it (`sh runtime.sh`) since csh doesn't grok `VAR=value cmd` syntax.
 
 **Run the tests**
 
@@ -72,7 +74,7 @@ Each editor is independent. Use any subset; skip the rest.
 
 xorgcist is a file emitter, not a config applier. Each editor produces standard `xorg.conf` snippets or `xinput` commands as plain text, exposed through a normal Save dialog and a Copy-to-clipboard button. There is no daemon, no sudo, no install workflow, no auto-revert. You review the generated text and decide where to put it — `/etc/X11/xorg.conf.d/`, an autostart script, version control, wherever fits your setup.
 
-Two safety nets sit between you and a broken display: a built-in validator that lints the generated config before save (required sections present, `ServerLayout` references resolve, no duplicate identifiers, BusIDs syntactically valid), and a **Test in nested server** button that boots a sandboxed X server on `:3` using the generated config — without touching your running session — so you can verify it works before installing it anywhere.
+A built-in validator lints the generated config before you save: required sections present, `ServerLayout` references resolve, no duplicate identifiers, BusIDs syntactically valid. For full validation that the config actually loads, install it in your real X session — there is intentionally no in-app dummy-driver dryrun, because the modern Linux session-security stack (Xorg.wrap, sticky-bit `/tmp`, root-owned X locks, dummy driver semantic gaps) makes such sandboxes brittle and low-value.
 
 ## Audience
 
