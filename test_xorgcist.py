@@ -886,7 +886,7 @@ class TestEmitRuntimeCommands(unittest.TestCase):
         s.touchscreens = [TouchscreenMapping(device_id=15, device_name="ELO",
                                              target_output="DP-1", enabled=False)]
         cmds = emit_runtime_commands(s)
-        self.assertTrue(any(c == "xinput disable 15" for c in cmds))
+        self.assertTrue(any(c == 'xinput disable "ELO"' for c in cmds))
         self.assertFalse(any("set-prop" in c for c in cmds))
 
     def test_enabled_touchscreen_emits_enable_then_setprop(self):
@@ -896,8 +896,8 @@ class TestEmitRuntimeCommands(unittest.TestCase):
                                              target_output="DP-1")]
         cmds = emit_runtime_commands(s)
         xinput = [c for c in cmds if c.startswith("xinput")]
-        self.assertEqual(xinput[0], "xinput enable 15")
-        self.assertTrue(xinput[1].startswith("xinput set-prop 15"))
+        self.assertEqual(xinput[0], 'xinput enable "ELO"')
+        self.assertTrue(xinput[1].startswith('xinput set-prop "ELO"'))
 
     def test_xinput_lines_have_no_display_prefix(self):
         # xinput enable / set-prop / disable are server-wide and inherit
@@ -1082,8 +1082,8 @@ GOLDEN_RUNTIME = [
     'DISPLAY="$_X.0" xrandr --output DP-1 --mode 2560x1440 --rate 144.00 --pos 0x0 --primary',
     'DISPLAY="$_X.0" xrandr --output DP-2 --mode 1920x1080 --rate 60.00 --pos 2560x360',
     'DISPLAY="$_X.1" xrandr --output HDMI-1 --mode 1920x1080 --rate 60.00 --pos 0x0 --rotate left',
-    'xinput enable 15',
-    'xinput set-prop 15 "Coordinate Transformation Matrix" '
+    'xinput enable "ELO"',
+    'xinput set-prop "ELO" "Coordinate Transformation Matrix" '
     '0.000000 -1.000000 1.000000 1.000000 0.000000 0.000000 0.000000 0.000000 1.000000',
 ]
 

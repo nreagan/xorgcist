@@ -760,22 +760,29 @@ def emit_runtime_commands(state: State) -> list[str]:
     # physical touch panel is. (Multi-pointer X via `xinput create-master /
     # reattach` is a separate feature for multi-user touch tables; not what
     # touchscreen calibration needs.)
+    #
+    # Reference devices by NAME, not integer ID: xinput device IDs aren't
+    # stable across reboots / USB re-enumeration / hotplug, so a script
+    # sourced from .xprofile that says `xinput enable 13` will silently
+    # affect the wrong device after the next reboot. Names from xinput list
+    # are stable.
     for ts in state.touchscreens:
+        ref = f'"{ts.device_name}"'
         if not ts.enabled:
-            cmds.append(f'xinput disable {ts.device_id}')
+            cmds.append(f'xinput disable {ref}')
             continue
         if ts.target_output is None:
             continue
         target = by_name.get(ts.target_output)
         if target is None or not is_active(target):
             continue
-        cmds.append(f'xinput enable {ts.device_id}')
+        cmds.append(f'xinput enable {ref}')
         # Pass `eff` (which has been collapsed for non-NVIDIA) so the matrix
         # is computed against the same screen layout the runtime script will
         # actually be applied against.
         m = derive_touchscreen_matrix(eff, ts.target_output)
         cmds.append(
-            f'xinput set-prop {ts.device_id} "Coordinate Transformation Matrix" '
+            f'xinput set-prop {ref} "Coordinate Transformation Matrix" '
             + " ".join(f"{v:.6f}" for v in m)
         )
     return cmds
