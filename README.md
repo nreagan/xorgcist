@@ -4,7 +4,7 @@
 
 A Linux GUI for X11 multi-display and input configuration — the things nvidia-settings stopped doing well.
 
-It reads your current setup, lets you visually edit display layout, input routing, and touchscreen mapping, and emits `xorg.conf` snippets and `xinput` commands as text for you to save wherever you want. Built for the X11-bound niches — sim rigs, kiosks, GPU passthrough, facility multi-display — that aren't migrating to Wayland.
+It reads your current display and input state, lets you visually edit display layout and touchscreen mapping, and emits `xorg.conf` snippets and `xinput` commands as text for you to save wherever you want. Built for the X11-bound niches — sim rigs, kiosks, GPU passthrough, facility multi-display — that aren't migrating to Wayland.
 
 ![xorgcist screenshot](screenshot.png)
 
@@ -47,12 +47,12 @@ python3 xorgcist.py --demo
 
 **Workflow**
 
-1. xorgcist opens populated with your current displays, input devices, and touchscreens — pulled from `xrandr`, `xinput`, and your existing `xorg.conf`.
-2. Edit any of the three independent sections (display layout, input routing, touchscreen mapping). Skip the ones you don't need.
+1. xorgcist opens populated with your current displays, input devices, and touchscreens — pulled from live `xrandr`, `xinput`, and GPU PCI data.
+2. Edit any of the independent sections you need: display layout and touchscreen mapping. The input devices view is informational.
 3. Review the generated `xorg.conf` snippet and runtime `xrandr` script in the preview panes. The built-in validator lints them on every change.
 4. Save via the standard file dialog or copy to clipboard. xorgcist does not pick paths or install anything for you — drop the snippet into `/etc/X11/xorg.conf.d/`, an autostart script, version control, or wherever fits your setup. The real test is loading it in your actual X session.
 
-> **Shell note:** the generated runtime script is POSIX sh. It works as-is in `.xinitrc`, autostart `Exec=`, systemd user units, or anywhere `/bin/sh` runs it (every Linux distro). Multi-X-screen scripts derive the X server number from `$DISPLAY` at runtime, so the same script works whether you log in first (`:0`), second (`:1`), or under multi-seat. csh users running it as a file are fine; csh users sourcing it interactively will need to wrap it (`sh runtime.sh`) since csh doesn't grok `VAR=value cmd` syntax.
+> **Shell note:** the generated runtime script is POSIX sh. It works as-is in `.xinitrc`, graphical-session autostart `Exec=`, or a systemd user unit tied to the graphical session. Do not put it in `.bashrc` or run it from SSH: those shells may not have the real local X11 `$DISPLAY` / `$XAUTHORITY`, and they run at the wrong time. Multi-X-screen scripts derive the X server number from `$DISPLAY` at runtime, so the same script works whether you log in first (`:0`), second (`:1`), or under multi-seat. csh users running it as a file are fine; csh users sourcing it interactively will need to wrap it (`sh runtime.sh`) since csh doesn't grok `VAR=value cmd` syntax.
 
 **Run the tests**
 
@@ -62,10 +62,10 @@ python3 -m unittest test_xorgcist.py
 
 ## What it does
 
-On launch, xorgcist reads your current `xorg.conf` and live `xrandr` / `xinput` state and presents three independent editors:
+On launch, xorgcist reads live `xrandr` / `xinput` / `lspci` state and presents three independent views:
 
 - **Display layout** — drag displays into position with absolute or relative offsets; assign displays to separate X screen IDs (`:0.0`, `:0.1`, …). This is the piece nvidia-settings used to do and no longer does.
-- **Input device routing** — assign keyboards, mice, tablets, and touchscreens to specific outputs or screens.
+- **Input devices** — view detected keyboards, mice, tablets, and touchscreens.
 - **Touchscreen mapping** — derives the `Coordinate Transformation Matrix` from the display layout so a touchscreen maps cleanly to the rectangle of its physical output.
 
 Each editor is independent. Use any subset; skip the rest.
@@ -96,10 +96,10 @@ Python 3 + [Dear PyGui](https://github.com/hoffstadt/DearPyGui) — a native imm
 
 **Driver coverage.** xorgcist emits two artifacts per save: a `xorg.conf` snippet and a runtime `xrandr` script.
 
-- **NVIDIA proprietary** is the primary supported driver. The xorg.conf uses NVIDIA's `MetaModes` to encode per-output positioning, rotation, mirror, and refresh inside the config file itself. The runtime script is redundant but consistent.
-- **AMD (`amdgpu`)** and **Intel (`modesetting` / `i915`)** ignore `MetaModes` entirely — for these drivers, the xorg.conf only sets up the X screens (which is universal X11) and the actual layout (positioning / rotation / mirror / scale / primary / disable) comes from the runtime `xrandr` script. The script is written to be portable across all drivers, with `DISPLAY=:0.M` prefixes for multi-X-screen setups so xrandr targets the right screen.
+- **NVIDIA proprietary** is the primary supported driver. The xorg.conf uses NVIDIA's `MetaModes` to encode per-output positioning, rotation, and mirroring inside the config file itself. The runtime script also applies refresh rates and primary-output selection.
+- **AMD (`amdgpu`)** and **Intel (`modesetting` / `i915`)** ignore `MetaModes` entirely — for these drivers, the xorg.conf only sets up a minimal single X screen and the actual layout (positioning / rotation / mirror / scale / primary / disable) comes from the runtime `xrandr` script. NVIDIA multi-X-screen runtime commands use display prefixes so xrandr targets the right screen.
 
-In practice: NVIDIA users can rely on xorg.conf alone; AMD/Intel users need the runtime script to be wired into their session startup (autostart, `.xinitrc`, systemd user unit, etc.). Both paths are emitted from the same UI.
+In practice: NVIDIA users can often rely on xorg.conf for the display layout itself, but should use the runtime script for refresh rates, primary-output selection, and touchscreens. AMD/Intel users need the runtime script to be wired into their session startup (autostart, `.xinitrc`, systemd user unit, etc.). Both paths are emitted from the same UI.
 
 ## License
 

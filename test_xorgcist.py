@@ -568,8 +568,9 @@ class TestEmitXorgConf(unittest.TestCase):
         self.assertIn('Section "Device"', text)
         self.assertIn('Section "Screen"', text)
         self.assertIn('Section "ServerLayout"', text)
-        self.assertIn("DP-1: 1920x1080_60+0+0", text)
-        self.assertIn("DP-2: 1920x1080_60+1920+0", text)
+        self.assertIn("DP-1: 1920x1080+0+0", text)
+        self.assertIn("DP-2: 1920x1080+1920+0", text)
+        self.assertNotIn("1920x1080_60", text)
 
     @staticmethod
     def _nvidia_gpu():
@@ -586,7 +587,7 @@ class TestEmitXorgConf(unittest.TestCase):
             Output("HDMI-1", connected=True, width=1920, height=1080, x=3840, y=0, screen_id=1),
         ]
         text = emit_xorg_conf(s)
-        self.assertIn("HDMI-1: 1920x1080_60+0+0", text)
+        self.assertIn("HDMI-1: 1920x1080+0+0", text)
 
     def test_separate_screens(self):
         s = State()
@@ -627,6 +628,21 @@ class TestEmitXorgConf(unittest.TestCase):
         s.outputs = [Output("DP-1", connected=True, width=1920, height=1080, rotation="left")]
         text = emit_xorg_conf(s)
         self.assertIn("{Rotation=left}", text)
+
+    def test_nvidia_binds_display_devices_per_screen(self):
+        # Multi-X-screen NVIDIA configs need each Screen to claim only its own
+        # physical display device(s); otherwise the first Screen can consume
+        # heads that later Screens need in order to initialize.
+        s = State()
+        s.gpus = [self._nvidia_gpu()]
+        s.outputs = [
+            Output("DP-0.8", connected=True, width=2560, height=1440, screen_id=0),
+            Output("DP-2.8", connected=True, width=2560, height=1440, x=2560, screen_id=0),
+            Output("HDMI-0", connected=True, width=1024, height=768, screen_id=1),
+        ]
+        text = emit_xorg_conf(s)
+        self.assertIn('Option      "UseDisplayDevice" "DP-0.8, DP-2.8"', text)
+        self.assertIn('Option      "UseDisplayDevice" "HDMI-0"', text)
 
     def test_no_primary_in_monitor(self):
         # Primary is silently ignored by all drivers in Monitor section;
@@ -886,7 +902,7 @@ class TestEmitRuntimeCommands(unittest.TestCase):
         s.touchscreens = [TouchscreenMapping(device_id=15, device_name="ELO",
                                              target_output="DP-1", enabled=False)]
         cmds = emit_runtime_commands(s)
-        self.assertTrue(any(c == 'xinput disable "ELO"' for c in cmds))
+        self.assertTrue(any(c == 'xinput disable ELO' for c in cmds))
         self.assertFalse(any("set-prop" in c for c in cmds))
 
     def test_enabled_touchscreen_emits_enable_then_setprop(self):
@@ -896,8 +912,26 @@ class TestEmitRuntimeCommands(unittest.TestCase):
                                              target_output="DP-1")]
         cmds = emit_runtime_commands(s)
         xinput = [c for c in cmds if c.startswith("xinput")]
-        self.assertEqual(xinput[0], 'xinput enable "ELO"')
-        self.assertTrue(xinput[1].startswith('xinput set-prop "ELO"'))
+        self.assertEqual(xinput[0], 'xinput enable ELO')
+        self.assertTrue(xinput[1].startswith('xinput set-prop ELO'))
+
+    def test_runtime_shell_quotes_device_and_output_names(self):
+        s = State()
+        s.outputs = [
+            Output("DP weird", connected=True, width=1920, height=1080,
+                   available_modes=[(1920, 1080, 60.0)]),
+            Output("Mirror Out", connected=True, width=1920, height=1080,
+                   mirror_of="DP weird"),
+        ]
+        s.touchscreens = [
+            TouchscreenMapping(device_id=15, device_name='Elo "quoted" touch',
+                               target_output="DP weird")
+        ]
+        cmds = emit_runtime_commands(s)
+        self.assertTrue(any("xrandr --output 'DP weird'" in c for c in cmds))
+        self.assertTrue(any("--same-as 'DP weird'" in c for c in cmds))
+        self.assertTrue(any(c == 'xinput enable \'Elo "quoted" touch\'' for c in cmds))
+        self.assertTrue(any("'Coordinate Transformation Matrix'" in c for c in cmds))
 
     def test_xinput_lines_have_no_display_prefix(self):
         # xinput enable / set-prop / disable are server-wide and inherit
@@ -1047,7 +1081,8 @@ Section "Screen"
     Identifier  "Screen0"
     Device      "Device0"
     Monitor     "Monitor0"
-    Option      "MetaModes" "DP-1: 2560x1440_144+0+0, DP-2: 1920x1080_60+2560+360"
+    Option      "UseDisplayDevice" "DP-1, DP-2"
+    Option      "MetaModes" "DP-1: 2560x1440+0+0, DP-2: 1920x1080+2560+360"
     SubSection  "Display"
         Depth       24
     EndSubSection
@@ -1064,7 +1099,8 @@ Section "Screen"
     Identifier  "Screen1"
     Device      "Device1"
     Monitor     "Monitor1"
-    Option      "MetaModes" "HDMI-1: 1920x1080_60+0+0 {Rotation=left}"
+    Option      "UseDisplayDevice" "HDMI-1"
+    Option      "MetaModes" "HDMI-1: 1920x1080+0+0 {Rotation=left}"
     SubSection  "Display"
         Depth       24
     EndSubSection
@@ -1082,8 +1118,8 @@ GOLDEN_RUNTIME = [
     'DISPLAY="$_X.0" xrandr --output DP-1 --mode 2560x1440 --rate 144.00 --pos 0x0 --primary',
     'DISPLAY="$_X.0" xrandr --output DP-2 --mode 1920x1080 --rate 60.00 --pos 2560x360',
     'DISPLAY="$_X.1" xrandr --output HDMI-1 --mode 1920x1080 --rate 60.00 --pos 0x0 --rotate left',
-    'xinput enable "ELO"',
-    'xinput set-prop "ELO" "Coordinate Transformation Matrix" '
+    'xinput enable ELO',
+    "xinput set-prop ELO 'Coordinate Transformation Matrix' "
     '0.000000 -1.000000 1.000000 1.000000 0.000000 0.000000 0.000000 0.000000 1.000000',
 ]
 
