@@ -35,7 +35,7 @@ You must be logged in at the target's console as the same user, because that Xau
 
 - **Move a display:** drag it on the canvas, or type X/Y. Positions are absolute desktop pixels. There is no snapping.
 - **Output fields:** Enabled, X screen (an existing one or `New`), Resolution (with aspect ratio), Refresh and Rotation.
-- **Touchscreens:** click *Add touchscreen*, pick the input device (or type its `xinput` name), then pick the display it should cover.
+- **Touchscreens:** click *Add touchscreen*, pick the input device (listed as `xinput` ID and name, or type an ID), then pick the display it should cover.
 - **Save or copy:** the bottom panes update live. Use *Copy* or *Save as...* on either one.
 
 ## What gets generated
@@ -48,6 +48,8 @@ You must be logged in at the target's console as the same user, because that Xau
 To install: `sudo cp xorg.conf /etc/X11/xorg.conf`, then restart X. If it doesn't come up as expected, run `grep -E '\((EE|WW)\)' /var/log/Xorg.0.log`. With rootless X the log is `~/.local/share/xorg/Xorg.0.log`.
 
 **Touchscreen commands.** A `sh` script with one `xinput set-prop ... "Coordinate Transformation Matrix"` line per touchscreen, calculated as on the [Arch wiki](https://wiki.archlinux.org/title/Calibrating_Touchscreen) with the display's rotation included. Run it inside the X session, for example from session autostart. X forgets the setting when the device is re-plugged or X restarts.
+
+Devices are referenced by their `xinput list` ID, so two identical touchscreens can be told apart. Working out which ID belongs to which physical screen is up to you. X assigns the IDs in a fixed order when it starts, so they stay the same across reboots as long as the same devices are plugged into the same ports. They can change after re-plugging a device or adding another input device.
 
 ## NVIDIA and X11 details
 
