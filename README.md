@@ -19,6 +19,19 @@ python3 xorgcist.py --demo           # built-in sample layout; runs anywhere, ev
 
 Needs Python 3.6 or newer (stock RHEL8 `python3` works) and tkinter. It reads `xrandr`, `xinput` and `/proc/driver/nvidia/gpus`. There are no other dependencies.
 
+### From another machine
+
+Like `nvidia-settings -c`, the `-c` / `--ctrl-display` option reads displays and input devices from one X display, while the window opens on `$DISPLAY`. Over SSH X forwarding:
+
+```sh
+ssh -Y you@target
+ls /tmp/.X11-unix/                              # X0, X1, ... = running X displays (RHEL8 desktop sessions are often :1)
+xauth merge /run/user/`id -u`/gdm/Xauthority    # authorize this SSH session for your GDM desktop session
+python3 xorgcist.py -c :1
+```
+
+You must be logged in at the target's console as the same user, because that Xauthority file belongs to the logged-in user. If X was started with `startx`, the cookie is already in `~/.Xauthority`, so skip the merge. The GPU list and saved files stay on the target, which is where they're needed.
+
 ## Using it
 
 - **Move a display:** drag it on the canvas, or type X/Y. Positions are absolute desktop pixels. There is no snapping.

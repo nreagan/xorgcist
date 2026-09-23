@@ -3,7 +3,12 @@
 touchscreen calibration commands. It only shows and saves text; nothing on the
 system is changed.
 
-Usage: python3 xorgcist.py [--demo]
+Usage: python3 xorgcist.py [--demo] [-c DISPLAY | --ctrl-display=DISPLAY]
+
+  -c, --ctrl-display  read displays and input devices from this X display
+                      (like nvidia-settings); the window still opens on $DISPLAY
+  --demo              use built-in sample data instead of this machine
+
 Needs Python 3.6+ and tkinter (RHEL8: dnf install python3-tkinter).
 """
 
@@ -76,10 +81,11 @@ SCREEN_RE = re.compile(r"^Screen \d+:.* current (\d+) x (\d+)")
 XINPUT_RE = re.compile(r"^\W*(.+?)\s+id=\d+\s+\[slave\s+pointer")
 
 
-def run(cmd):
+def run(cmd, display=None):
+    env = dict(os.environ, DISPLAY=display) if display else None
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=10)
+                           stderr=subprocess.DEVNULL, timeout=10, env=env)
     except (OSError, subprocess.SubprocessError):
         return ""
     return p.stdout.decode("utf-8", "replace") if p.returncode == 0 else ""
@@ -165,17 +171,17 @@ def nvidia_gpus():
     return [pci_to_busid(n) for n in names]
 
 
-def detect(demo):
+def detect(demo, ctrl_display=None):
     if demo:
         listings, xinput_text, gpus = DEMO_XRANDR, DEMO_XINPUT, DEMO_GPUS
     else:
         listings = []
         for n in range(16):
-            text = run(["xrandr", "--screen", str(n), "--query"])
+            text = run(["xrandr", "--screen", str(n), "--query"], ctrl_display)
             if not text:
                 break
             listings.append(text)
-        xinput_text, gpus = run(["xinput", "list"]), nvidia_gpus()
+        xinput_text, gpus = run(["xinput", "list"], ctrl_display), nvidia_gpus()
 
     # xrandr positions are per X screen; lay the X screens out left to right.
     displays, origin = [], 0
@@ -197,13 +203,15 @@ def detect(demo):
              "selected": 0 if displays else None}
     compact_screens(state)
 
+    target = ctrl_display or os.environ.get("DISPLAY", "")
     if demo:
         status = "Demo data: nothing was read from this machine."
     elif not displays:
-        status = "xrandr found no connected displays. Run this inside an X session."
+        status = ("xrandr found no connected displays on X display %s. "
+                  "Check the display number and X authorization (see README)." % (target or "(unset)"))
     else:
-        status = "Found %d display(s) on %d X screen(s). NVIDIA GPU: %s." % (
-            len(displays), len(listings),
+        status = "X display %s: %d display(s) on %d X screen(s). NVIDIA GPU: %s." % (
+            target, len(displays), len(listings),
             ", ".join(gpus) or "none found in /proc/driver/nvidia/gpus, so BusID is left out")
     return state, status
 
@@ -788,12 +796,28 @@ def build_ui(root, state, status):
     return ui
 
 
+def parse_args(args):
+    demo, ctrl_display = False, None
+    args = list(args)
+    while args:
+        a = args.pop(0)
+        if a == "--demo":
+            demo = True
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        elif a in ("-c", "--ctrl-display") and args:
+            ctrl_display = args.pop(0)
+        elif a.startswith("--ctrl-display="):
+            ctrl_display = a.split("=", 1)[1]
+        else:
+            sys.exit(__doc__.strip())
+    return demo, ctrl_display
+
+
 def main():
-    args = sys.argv[1:]
-    if args not in ([], ["--demo"]):
-        sys.exit("usage: xorgcist.py [--demo]")
-    demo = bool(args)
-    state, status = detect(demo)
+    demo, ctrl_display = parse_args(sys.argv[1:])
+    state, status = detect(demo, ctrl_display)
     try:
         root = tk.Tk()
     except tk.TclError as e:
