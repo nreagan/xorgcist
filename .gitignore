@@ -8,6 +8,3 @@ venv/
 .ruff_cache/
 build/
 dist/
-
-.claude/
-CLAUDE.md

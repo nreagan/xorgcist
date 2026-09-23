@@ -1,106 +1,58 @@
 # xorgcist
 
-[![tests](https://github.com/nreagan/xorgcist/actions/workflows/test.yml/badge.svg)](https://github.com/nreagan/xorgcist/actions/workflows/test.yml)
+A small GUI for laying out NVIDIA displays on X11. Drag displays into place (or type exact positions), choose resolution, refresh rate, rotation and X screen, and xorgcist generates:
 
-A Linux GUI for X11 multi-display and input configuration — the things nvidia-settings stopped doing well.
+- an `xorg.conf` for the NVIDIA driver, and
+- `xinput` commands that map each touchscreen onto its display.
 
-It reads your current display and input state, lets you visually edit display layout and touchscreen mapping, and emits `xorg.conf` snippets and `xinput` commands as text for you to save wherever you want. Built for the X11-bound niches — sim rigs, kiosks, GPU passthrough, facility multi-display — that aren't migrating to Wayland.
+It never changes your system. You review the text, then copy it or save it wherever you like.
 
 ![xorgcist screenshot](screenshot.png)
 
-## Install and use
-
-**Requirements**
-
-- Linux running an X11 session (not Wayland)
-- Python 3.10 or 3.11 (dearpygui 1.9.0 has no wheels for 3.12+)
-- `xrandr`, `xinput`, and `lspci` on `PATH` (standard on any X11 desktop)
-
-> **glibc note**: `requirements.txt` pins `dearpygui<=1.9.0` because 1.9.1+ require glibc 2.29+. RHEL8 ships glibc 2.28, so newer wheels install but fail at import. If you're on a newer distro you can lift the cap, but the pinned version works everywhere.
-
-**Install**
+## Run
 
 ```sh
-git clone https://github.com/nreagan/xorgcist.git
-cd xorgcist
-pip install -r requirements.txt
+sudo dnf install python3-tkinter     # Debian/Ubuntu: sudo apt install python3-tk
+python3 xorgcist.py                  # inside the X session you want to configure
+python3 xorgcist.py --demo           # built-in sample layout; runs anywhere, even on Wayland
 ```
 
-If you'd rather not touch system Python, use a venv or `pipx`:
+Needs Python 3.6 or newer (stock RHEL8 `python3` works) and tkinter. It reads `xrandr`, `xinput` and `/proc/driver/nvidia/gpus`. There are no other dependencies.
 
-```sh
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
+## Using it
 
-**Run**
+- **Move a display:** drag it on the canvas, or type X/Y. Positions are absolute desktop pixels. There is no snapping.
+- **Output fields:** Enabled, X screen (an existing one or `New`), Resolution (with aspect ratio), Refresh and Rotation.
+- **Touchscreens:** click *Add touchscreen*, pick the input device (or type its `xinput` name), then pick the display it should cover.
+- **Save or copy:** the bottom panes update live. Use *Copy* or *Save as...* on either one.
 
-```sh
-python3 xorgcist.py
-```
+## What gets generated
 
-If you want to poke at the UI without a real X11 session (e.g. on a Wayland machine), launch with synthetic data:
+**xorg.conf.** One `Device` and one `Screen` per X screen, placed with absolute coordinates in `ServerLayout`.
+- Each screen's `MetaModes` lists its displays with mode, offset and rotation, e.g. `DP-0: 2560x1440_144 +0+0`.
+- `Virtual` fixes each X screen's size to the bounding box of its displays.
+- When several X screens share one GPU, each `Device` gets `Screen N` and each `Screen` gets `UseDisplayDevice`, so every X screen drives exactly the displays you assigned.
 
-```sh
-python3 xorgcist.py --demo
-```
+To install: `sudo cp xorg.conf /etc/X11/xorg.conf`, then restart X. If it doesn't come up as expected, run `grep -E '\((EE|WW)\)' /var/log/Xorg.0.log`. With rootless X the log is `~/.local/share/xorg/Xorg.0.log`.
 
-**Workflow**
+**Touchscreen commands.** A `sh` script with one `xinput set-prop ... "Coordinate Transformation Matrix"` line per touchscreen, calculated as on the [Arch wiki](https://wiki.archlinux.org/title/Calibrating_Touchscreen) with the display's rotation included. Run it inside the X session, for example from session autostart. X forgets the setting when the device is re-plugged or X restarts.
 
-1. xorgcist opens populated with your current displays, input devices, and touchscreens — pulled from live `xrandr`, `xinput`, and GPU PCI data.
-2. Edit any of the independent sections you need: display layout and touchscreen mapping. The input devices view is informational.
-3. Review the generated `xorg.conf` snippet and runtime `xrandr` script in the preview panes. The built-in validator lints them on every change.
-4. Save via the standard file dialog or copy to clipboard. xorgcist does not pick paths or install anything for you — drop the snippet into `/etc/X11/xorg.conf.d/`, an autostart script, version control, or wherever fits your setup. The real test is loading it in your actual X session.
+## NVIDIA and X11 details
 
-> **Shell note:** the generated runtime script is POSIX sh. It works as-is in `.xinitrc`, graphical-session autostart `Exec=`, or a systemd user unit tied to the graphical session. Do not put it in `.bashrc` or run it from SSH: those shells may not have the real local X11 `$DISPLAY` / `$XAUTHORITY`, and they run at the wrong time. Multi-X-screen scripts derive the X server number from `$DISPLAY` at runtime, so the same script works whether you log in first (`:0`), second (`:1`), or under multi-seat. csh users running it as a file are fine; csh users sourcing it interactively will need to wrap it (`sh runtime.sh`) since csh doesn't grok `VAR=value cmd` syntax.
+- **Mode names.** NVIDIA calls a mode `WxH_R`, with R the refresh rate rounded to a whole number. Plain `WxH` means "the driver's best mode at that size", so xorgcist only includes the rate when a resolution offers more than one. The README says these names are built "approximately" and can gain a suffix (`_60_0`). If the log says a mode wasn't found, add `Option "ModeDebug" "true"` to the `Device` section. The X log will then list the exact names.
+- **Touch matrix size.** X scales touch input to the bounding box of *all* X screens (xserver `scale_to_desktop`), so the matrix is always relative to the whole desktop.
+- **Moving between X screens.** The pointer, including touch, only crosses between X screens that share an edge, one screen per event. xorgcist warns when an X screen can't be reached.
+- **BusID** is decimal (`PCI:bus@domain:device:function`), while `lspci` prints hex. xorgcist converts it.
 
-**Run the tests**
+## References
 
-```sh
-python3 -m unittest test_xorgcist.py
-```
-
-## What it does
-
-On launch, xorgcist reads live `xrandr` / `xinput` / `lspci` state and presents three independent views:
-
-- **Display layout** — drag displays into position with absolute or relative offsets; assign displays to separate X screen IDs (`:0.0`, `:0.1`, …). This is the piece nvidia-settings used to do and no longer does.
-- **Input devices** — view detected keyboards, mice, tablets, and touchscreens.
-- **Touchscreen mapping** — derives the `Coordinate Transformation Matrix` from the display layout so a touchscreen maps cleanly to the rectangle of its physical output.
-
-Each editor is independent. Use any subset; skip the rest.
-
-## How it works
-
-xorgcist is a file emitter, not a config applier. Each editor produces standard `xorg.conf` snippets or `xinput` commands as plain text, exposed through a normal Save dialog and a Copy-to-clipboard button. There is no daemon, no sudo, no install workflow, no auto-revert. You review the generated text and decide where to put it — `/etc/X11/xorg.conf.d/`, an autostart script, version control, wherever fits your setup.
-
-A built-in validator lints the generated config before you save: required sections present, `ServerLayout` references resolve, no duplicate identifiers, BusIDs syntactically valid. For full validation that the config actually loads, install it in your real X session — there is intentionally no in-app dummy-driver dryrun, because the modern Linux session-security stack (Xorg.wrap, sticky-bit `/tmp`, root-owned X locks, dummy driver semantic gaps) makes such sandboxes brittle and low-value.
-
-## Audience
-
-Power users on X11 by choice: simulator and arcade rigs, kiosk and digital signage operators, multi-seat lab and classroom setups, GPU passthrough hosts, accessibility installations, Wacom-heavy creative workflows, retro and specialty hardware, facility multi-display installations.
-
-If your current workflow is "open nvidia-settings for the bits it still does, then hand-edit `xorg.conf` for the bits it doesn't," xorgcist is for you.
-
-## Non-goals
-
-- Wayland support
-- Cross-session sync, cloud, fleet management
-- Bundled "profile" abstractions on top of the saved files
-- Device-level touchscreen calibration (tap-target routines for misbehaving panels)
-- Anything that runs in the background or modifies system files on your behalf
-
-## Stack
-
-Python 3 + [Dear PyGui](https://github.com/hoffstadt/DearPyGui) — a native immediate-mode GUI framework. The whole UI is described fresh each frame from a single `UIState` dataclass; event handlers mutate state and the next frame reflects it. No widget-vs-app-state desync, snapshot-undo for free, trivial to test by asserting against `UIState` without rendering. Dear PyGui renders via OpenGL, which is reliably available on any system running an X session. Tests use stdlib `unittest`.
-
-**Driver coverage.** xorgcist emits two artifacts per save: a `xorg.conf` snippet and a runtime `xrandr` script.
-
-- **NVIDIA proprietary** is the primary supported driver. The xorg.conf uses NVIDIA's `MetaModes` to encode per-output positioning, rotation, and mirroring inside the config file itself. The runtime script also applies refresh rates and primary-output selection.
-- **AMD (`amdgpu`)** and **Intel (`modesetting` / `i915`)** ignore `MetaModes` entirely — for these drivers, the xorg.conf only sets up a minimal single X screen and the actual layout (positioning / rotation / mirror / scale / primary / disable) comes from the runtime `xrandr` script. NVIDIA multi-X-screen runtime commands use display prefixes so xrandr targets the right screen.
-
-In practice: NVIDIA users can often rely on xorg.conf for the display layout itself, but should use the runtime script for refresh rates, primary-output selection, and touchscreens. AMD/Intel users need the runtime script to be wired into their session startup (autostart, `.xinitrc`, systemd user unit, etc.). Both paths are emitted from the same UI.
+- NVIDIA driver README for your exact version (`cat /proc/driver/nvidia/version`): `https://download.nvidia.com/XFree86/Linux-x86_64/<version>/README/README.txt`. Relevant sections:
+  - "Configuring Multiple Display Devices on One X Screen" (MetaModes)
+  - "Configuring Multiple X Screens on One Card"
+  - Appendix B (X config options)
+  - Appendix C (display device names)
+- `man xorg.conf`: `ServerLayout`, `Device` / `Screen`, `TransformationMatrix`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
