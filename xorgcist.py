@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 """xorgcist: arrange NVIDIA X11 displays, then generate an xorg.conf and
 touchscreen calibration commands. It only shows and saves text; nothing on the
-system is changed.
-
-Usage: python3 xorgcist.py [--demo] [-c DISPLAY | --ctrl-display=DISPLAY]
-
-  -c, --ctrl-display  read displays and input devices from this X display
-                      (like nvidia-settings); the window still opens on $DISPLAY
-  --demo              use built-in sample data instead of this machine
-
-Needs Python 3.6+ and tkinter (RHEL8: dnf install python3-tkinter).
+system is changed. Needs Python 3.6+ and tkinter (RHEL8: dnf install python3-tkinter).
 """
 
+import argparse
 import math
 import os
 import re
@@ -38,39 +31,6 @@ ASPECTS = [(16, 9), (16, 10), (4, 3), (5, 4), (21, 9), (32, 9), (3, 2), (1, 1)]
 
 SCREEN_COLORS = ["#a9c8f5", "#f7c99b", "#b3e0a6", "#f5b1b1",
                  "#d2bdf2", "#f2e59b", "#a8e3dd", "#e3c7ad"]
-
-DEMO_XRANDR = [
-    """Screen 0: minimum 8 x 8, current 5120 x 1440, maximum 32767 x 32767
-DP-0 disconnected (normal left inverted right x axis y axis)
-DP-0.8 connected primary 2560x1440+0+0 (normal left inverted right x axis y axis) 597mm x 336mm
-   2560x1440     59.95*+ 143.97   119.88
-   1920x1080     60.00    59.94    50.00
-   1280x1024     60.02
-   1024x768      60.00
-DP-2.8 connected 2560x1440+2560+0 (normal left inverted right x axis y axis) 597mm x 336mm
-   2560x1440     59.95*+
-   1920x1080     60.00    59.94
-DP-4 connected (normal left inverted right x axis y axis) 527mm x 296mm
-   3840x2160     60.00 +  30.00
-   1920x1080     60.00    59.94
-""",
-    """Screen 1: minimum 8 x 8, current 768 x 1024, maximum 32767 x 32767
-HDMI-0 connected 768x1024+0+0 left (normal left inverted right x axis y axis) 304mm x 228mm
-   1024x768      60.00*+  75.03
-   800x600       60.32
-""",
-]
-
-DEMO_XINPUT = """⎡ Virtual core pointer                    \tid=2\t[master pointer  (3)]
-⎜   ↳ Virtual core XTEST pointer              \tid=4\t[slave  pointer  (2)]
-⎜   ↳ Logitech USB Optical Mouse              \tid=9\t[slave  pointer  (2)]
-⎜   ↳ ELAN Touchscreen                        \tid=11\t[slave  pointer  (2)]
-⎣ Virtual core keyboard                   \tid=3\t[master keyboard (2)]
-    ↳ Virtual core XTEST keyboard             \tid=5\t[slave  keyboard (3)]
-    ↳ AT Translated Set 2 keyboard            \tid=12\t[slave  keyboard (3)]
-"""
-
-DEMO_GPUS = ["PCI:1:0:0"]
 
 # ---------------------------------------------------------------- detect
 
@@ -171,17 +131,14 @@ def nvidia_gpus():
     return [pci_to_busid(n) for n in names]
 
 
-def detect(demo, ctrl_display=None):
-    if demo:
-        listings, xinput_text, gpus = DEMO_XRANDR, DEMO_XINPUT, DEMO_GPUS
-    else:
-        listings = []
-        for n in range(16):
-            text = run(["xrandr", "--screen", str(n), "--query"], ctrl_display)
-            if not text:
-                break
-            listings.append(text)
-        xinput_text, gpus = run(["xinput", "list"], ctrl_display), nvidia_gpus()
+def detect(ctrl_display=None):
+    listings = []
+    for n in range(16):
+        text = run(["xrandr", "--screen", str(n), "--query"], ctrl_display)
+        if not text:
+            break
+        listings.append(text)
+    xinput_text, gpus = run(["xinput", "list"], ctrl_display), nvidia_gpus()
 
     # xrandr positions are per X screen; lay the X screens out left to right.
     displays, origin = [], 0
@@ -204,9 +161,7 @@ def detect(demo, ctrl_display=None):
     compact_screens(state)
 
     target = ctrl_display or os.environ.get("DISPLAY", "")
-    if demo:
-        status = "Demo data: nothing was read from this machine."
-    elif not displays:
+    if not displays:
         status = ("xrandr found no connected displays on X display %s. "
                   "Check the display number and X authorization (see README)." % (target or "(unset)"))
     else:
@@ -796,33 +751,20 @@ def build_ui(root, state, status):
     return ui
 
 
-def parse_args(args):
-    demo, ctrl_display = False, None
-    args = list(args)
-    while args:
-        a = args.pop(0)
-        if a == "--demo":
-            demo = True
-        elif a in ("-h", "--help"):
-            print(__doc__.strip())
-            sys.exit(0)
-        elif a in ("-c", "--ctrl-display") and args:
-            ctrl_display = args.pop(0)
-        elif a.startswith("--ctrl-display="):
-            ctrl_display = a.split("=", 1)[1]
-        else:
-            sys.exit(__doc__.strip())
-    return demo, ctrl_display
-
-
 def main():
-    demo, ctrl_display = parse_args(sys.argv[1:])
-    state, status = detect(demo, ctrl_display)
+    parser = argparse.ArgumentParser(
+        description="Arrange NVIDIA X11 displays and generate an xorg.conf plus "
+                    "touchscreen xinput commands. Nothing on the system is changed.")
+    parser.add_argument("-c", "--ctrl-display", metavar="DISPLAY",
+                        help="read displays and input devices from this X display, "
+                             "like nvidia-settings -c; the window still opens on $DISPLAY")
+    args = parser.parse_args()
+    state, status = detect(args.ctrl_display)
     try:
         root = tk.Tk()
     except tk.TclError as e:
         sys.exit("xorgcist: cannot open a window: %s" % e)
-    root.title("xorgcist (demo)" if demo else "xorgcist")
+    root.title("xorgcist")
     ui = build_ui(root, state, status)
     refresh(state, ui)
     root.mainloop()

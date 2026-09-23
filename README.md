@@ -14,7 +14,6 @@ It never changes your system. You review the text, then copy it or save it where
 ```sh
 sudo dnf install python3-tkinter     # Debian/Ubuntu: sudo apt install python3-tk
 python3 xorgcist.py                  # inside the X session you want to configure
-python3 xorgcist.py --demo           # built-in sample layout; runs anywhere, even on Wayland
 ```
 
 Needs Python 3.6 or newer (stock RHEL8 `python3` works) and tkinter. It reads `xrandr`, `xinput` and `/proc/driver/nvidia/gpus`. There are no other dependencies.
