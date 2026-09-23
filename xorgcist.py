@@ -207,12 +207,13 @@ def aspect_label(w, h):
 
 
 def mode_name(d):
-    # NVIDIA names pool modes "WxH_R" (R = rounded refresh); plain "WxH" is
-    # the driver's best mode at that size, so only name the rate if there's a choice.
+    # NVIDIA names pool modes "WxH_R" (R = roughly the rounded refresh) and also
+    # gives the best mode at each size (highest refresh) the plain name "WxH",
+    # which is what nvidia-settings writes; only spell out a lower rate.
     w, h = d["size"]
-    if len(d["modes"][d["size"]]) > 1:
-        return "%dx%d_%d" % (w, h, int(d["rate"] + 0.5))
-    return "%dx%d" % (w, h)
+    if d["rate"] == max(d["modes"][d["size"]]):
+        return "%dx%d" % (w, h)
+    return "%dx%d_%d" % (w, h, int(d["rate"] + 0.5))
 
 
 def compact_screens(state):

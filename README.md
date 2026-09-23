@@ -54,7 +54,7 @@ Devices are referenced by their `xinput list` ID, so two identical touchscreens 
 
 ## NVIDIA and X11 details
 
-- **Mode names.** NVIDIA calls a mode `WxH_R`, with R the refresh rate rounded to a whole number. Plain `WxH` means "the driver's best mode at that size", so xorgcist only includes the rate when a resolution offers more than one. The README says these names are built "approximately" and can gain a suffix (`_60_0`). If the log says a mode wasn't found, add `Option "ModeDebug" "true"` to the `Device` section. The X log will then list the exact names.
+- **Mode names.** NVIDIA calls a mode `WxH_R`, with R the refresh rate rounded to a whole number. Plain `WxH` is the driver's best mode at that size (the highest refresh rate), which is also what nvidia-settings writes. xorgcist uses it when you pick the top rate and only writes `WxH_R` for a lower one. The README says these names are built "approximately" and can gain a suffix (`_60_0`). If the log says a mode wasn't found, add `Option "ModeDebug" "true"` to the `Device` section. The X log will then list the exact names.
 - **Touch matrix size.** X scales touch input to the bounding box of *all* X screens (xserver `scale_to_desktop`), so the matrix is always relative to the whole desktop.
 - **Moving between X screens.** The pointer, including touch, only crosses between X screens that share an edge, one screen per event. xorgcist warns when an X screen can't be reached.
 - **BusID** is decimal (`PCI:bus@domain:device:function`), while `lspci` prints hex. xorgcist converts it.
