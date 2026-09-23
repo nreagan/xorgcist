@@ -34,14 +34,15 @@ You must be logged in at the target's console as the same user, because that Xau
 ## Using it
 
 - **Move a display:** drag it on the canvas, or type X/Y. Positions are absolute desktop pixels. There is no snapping.
-- **Output fields:** Enabled, X screen (an existing one or `New`), Resolution (with aspect ratio), Refresh and Rotation.
+- **Output fields:** Enabled, X screen (an existing one or `New`), Resolution (with aspect ratio), Refresh, Rotation, Primary display (one per X screen) and Force full composition pipeline (NVIDIA's tearing fix).
 - **Touchscreens:** click *Add touchscreen*, pick the input device (listed as `xinput` ID and name, or type an ID), then pick the display it should cover.
 - **Save or copy:** the bottom panes update live. Use *Copy* or *Save as...* on either one.
 
 ## What gets generated
 
 **xorg.conf.** One `Device` and one `Screen` per X screen, placed with absolute coordinates in `ServerLayout`.
-- Each screen's `MetaModes` lists its displays with mode, offset and rotation, e.g. `DP-0: 2560x1440_144 +0+0`.
+- Each screen's `MetaModes` lists its displays with mode, offset and rotation, e.g. `DP-0: 2560x1440_144 +0+0 {Rotation=left, ForceFullCompositionPipeline=On}`.
+- The primary display is set with `Option "nvidiaXineramaInfoOrder" "DP-0"`, which is what nvidia-settings writes for "Make this the primary display".
 - `Virtual` fixes each X screen's size to the bounding box of its displays.
 - When several X screens share one GPU, each `Device` gets `Screen N` and each `Screen` gets `UseDisplayDevice`, so every X screen drives exactly the displays you assigned.
 

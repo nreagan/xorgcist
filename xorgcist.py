@@ -66,6 +66,7 @@ def parse_xrandr(text):
                 g = GEOMETRY_RE.search(head)
                 d = {"name": m.group(1), "modes": {}, "size": None, "rate": None,
                      "preferred": None, "enabled": bool(g), "screen": 0,
+                     "primary": "primary" in head.split(), "full_composition": False,
                      "rotation": next((w for w in head.split() if w in ROTATIONS), "normal"),
                      "x": int(g.group(3)) if g else 0, "y": int(g.group(4)) if g else 0}
                 displays.append(d)
@@ -272,6 +273,15 @@ def unreachable_screens(state):
 # ---------------------------------------------------------------- emit
 
 
+def metamode_attrs(d):
+    attrs = []
+    if d["rotation"] != "normal":
+        attrs.append("Rotation=%s" % d["rotation"])
+    if d["full_composition"]:
+        attrs.append("ForceFullCompositionPipeline=On")
+    return " {%s}" % ", ".join(attrs) if attrs else ""
+
+
 def emit_xorg_conf(state):
     shown = enabled(state)
     if not shown:
@@ -295,11 +305,9 @@ def emit_xorg_conf(state):
             sections.append("    Screen          %d" % gpus[:s].count(gpu))
         sections.append("EndSection")
 
-        metamodes = ", ".join(
-            "%s: %s +%d+%d%s" % (d["name"], mode_name(d), d["x"] - sx, d["y"] - sy,
-                                 "" if d["rotation"] == "normal"
-                                 else " {Rotation=%s}" % d["rotation"])
-            for d in ds)
+        metamodes = ", ".join("%s: %s +%d+%d%s" % (d["name"], mode_name(d), d["x"] - sx,
+                                                     d["y"] - sy, metamode_attrs(d))
+                              for d in ds)
         sections += ["", 'Section "Screen"',
                      '    Identifier     "Screen%d"' % s,
                      '    Device         "Device%d"' % s,
@@ -307,6 +315,9 @@ def emit_xorg_conf(state):
         if shared_gpu:
             sections.append('    Option         "UseDisplayDevice" "%s"'
                             % ", ".join(d["name"] for d in ds))
+        for d in ds:
+            if d["primary"]:
+                sections.append('    Option         "nvidiaXineramaInfoOrder" "%s"' % d["name"])
         sections += ['    Option         "MetaModes" "%s"' % metamodes,
                      '    SubSection     "Display"',
                      "        Depth       24",
@@ -423,6 +434,8 @@ def draw_canvas(state, ui):
                                                 d["rate"], d["x"], d["y"])
         if d["rotation"] != "normal":
             label += "\nrotated " + d["rotation"]
+        if d["primary"]:
+            label += "\nprimary"
         c.create_text((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, text=label, justify="center",
                       font=font, width=max(b[2] - b[0] - 6, 1))
 
@@ -445,7 +458,7 @@ def set_text(widget, text):
 
 def sync_panel(state, ui, skip_xy):
     ui["display"]["values"] = [display_label(d) for d in state["displays"]]
-    fields = [ui[k] for k in ("screen", "res", "rate", "rot", "x", "y")]
+    fields = [ui[k] for k in ("screen", "res", "rate", "rot", "x", "y", "primary_cb", "fcp_cb")]
     if state["selected"] is None:
         for w in fields + [ui["enabled_cb"]]:
             w.state(["disabled"])
@@ -462,6 +475,8 @@ def sync_panel(state, ui, skip_xy):
     ui["rate"]["values"] = ["%.2f Hz" % r for r in rates]
     ui["rate"].current(rates.index(d["rate"]))
     ui["rot"].set(d["rotation"])
+    ui["primary"].set(1 if d["primary"] else 0)
+    ui["fcp"].set(1 if d["full_composition"] else 0)
     if not skip_xy:
         set_entry(ui["x"], d["x"])
         set_entry(ui["y"], d["y"])
@@ -566,6 +581,7 @@ def on_pick_display(state, ui):
 def on_enabled(state, ui):
     d = selected(state)
     d["enabled"] = bool(ui["enabled"].get())
+    d["primary"] = False
     if d["enabled"]:
         others = {o["screen"] for o in enabled(state) if o is not d}
         d["screen"] = min(d["screen"], len(others))
@@ -575,7 +591,9 @@ def on_enabled(state, ui):
 
 def on_screen(state, ui):
     value = ui["screen"].get()
-    selected(state)["screen"] = screen_count(state) if value == "New" else int(value)
+    d = selected(state)
+    d["screen"] = screen_count(state) if value == "New" else int(value)
+    d["primary"] = False
     compact_screens(state)
     refresh(state, ui)
 
@@ -595,6 +613,20 @@ def on_rate(state, ui):
 
 def on_rotation(state, ui):
     selected(state)["rotation"] = ui["rot"].get()
+    refresh(state, ui)
+
+
+def on_primary(state, ui):
+    d = selected(state)
+    for o in state["displays"]:
+        if o["screen"] == d["screen"]:
+            o["primary"] = False
+    d["primary"] = bool(ui["primary"].get())
+    refresh(state, ui)
+
+
+def on_full_composition(state, ui):
+    selected(state)["full_composition"] = bool(ui["fcp"].get())
     refresh(state, ui)
 
 
@@ -727,6 +759,13 @@ def build_ui(root, state, status):
         ui[key].pack(side="left", padx=(2, 8))
         ui[key].bind("<KeyRelease>", lambda e, k=key: on_position(state, ui, k))
         ui[key].bind("<FocusOut>", lambda e: refresh(state, ui))
+    ui["primary"], ui["fcp"] = tk.IntVar(), tk.IntVar()
+    ui["primary_cb"] = ttk.Checkbutton(props, text="Primary display of its X screen",
+                                       variable=ui["primary"], command=lambda: on_primary(state, ui))
+    ui["primary_cb"].grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    ui["fcp_cb"] = ttk.Checkbutton(props, text="Force full composition pipeline (tearing fix)",
+                                   variable=ui["fcp"], command=lambda: on_full_composition(state, ui))
+    ui["fcp_cb"].grid(row=8, column=0, columnspan=2, sticky="w")
 
     ui["gpu_rows"] = ttk.LabelFrame(side, text="GPU per X screen", padding=6)
     if len(state["gpus"]) > 1:
